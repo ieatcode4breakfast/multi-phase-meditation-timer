@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Meditation Timer</string>
+    <string name="title_activity_main">Meditation Timer</string>
+    <string name="package_name">com.ieatcode4breakfast.meditationtimer</string>
+    <string name="custom_url_scheme">com.ieatcode4breakfast.meditationtimer</string>
+</resources>

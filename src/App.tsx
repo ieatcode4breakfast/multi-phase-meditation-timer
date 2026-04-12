@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Plus, Trash2, Play, Pause, Square, ChevronUp, ChevronDown, Volume2, RotateCcw } from 'lucide-react';
+import { Capacitor } from '@capacitor/core';
+import { ForegroundService } from '@capawesome-team/capacitor-android-foreground-service';
 
 type Phase = {
   id: string;
@@ -8,6 +10,8 @@ type Phase = {
   seconds: number;
   repeat: number;
 };
+
+const isAndroid = Capacitor.getPlatform() === 'android';
 
 export default function App() {
   const [phases, setPhases] = useState<Phase[]>(() => {
@@ -68,14 +72,17 @@ export default function App() {
   const [isResetModalOpen, setIsResetModalOpen] = useState(false);
   const [isStopModalOpen, setIsStopModalOpen] = useState(false);
   const [wasRunningBeforeStop, setWasRunningBeforeStop] = useState(false);
-  
+
   const [isCountingDown, setIsCountingDown] = useState(false);
   const [extendedTime, setExtendedTime] = useState(0);
   const [isExtended, setIsExtended] = useState(false);
-  
+
   const wakeLockRef = useRef<any>(null);
 
+  // Screen wake lock — web only; Android foreground service provides this natively
   useEffect(() => {
+    if (isAndroid) return;
+
     const requestWakeLock = async () => {
       try {
         if ('wakeLock' in navigator) {
@@ -121,6 +128,10 @@ export default function App() {
   const bell2Ref = useRef<HTMLAudioElement>(null);
   const timeoutsRef = useRef<NodeJS.Timeout[]>([]);
 
+  // Timestamp refs — source of truth for background-safe timing
+  const phaseEndTimeRef = useRef<number>(0);
+  const extendedStartTimeRef = useRef<number>(0);
+
   const totalSeconds = phases.reduce((acc, phase) => {
     const phaseSeconds = (phase.hours || 0) * 3600 + (phase.minutes || 0) * 60 + (phase.seconds || 0);
     const repeats = phase.repeat || 1;
@@ -130,7 +141,7 @@ export default function App() {
   const calculateTotalTimeRemaining = () => {
     if (isFinished || isExtended) return 0;
     if (activePhaseIndex === null) return 0;
-    
+
     let remaining = timeLeft;
     for (let i = activePhaseIndex + 1; i < executionPhases.length; i++) {
       remaining += (executionPhases[i].hours || 0) * 3600 + executionPhases[i].minutes * 60 + executionPhases[i].seconds;
@@ -150,6 +161,16 @@ export default function App() {
     const m = Math.floor((totalSecs % 3600) / 60);
     const s = totalSecs % 60;
     return `${h} hours ${m} minutes and ${s} seconds`;
+  };
+
+  const formatTime = (totalSecs: number) => {
+    const h = Math.floor(totalSecs / 3600);
+    const m = Math.floor((totalSecs % 3600) / 60);
+    const s = totalSecs % 60;
+    if (h > 0) {
+      return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    }
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
   const getSessionStats = () => {
@@ -194,35 +215,63 @@ export default function App() {
     playStrike(bell1Ref.current); // T = 0
   };
 
+  // Main timer effect — uses timestamp refs for background-safe accuracy
   useEffect(() => {
     let interval: NodeJS.Timeout;
 
     if (isRunning) {
       if (isExtended) {
         interval = setInterval(() => {
-          setExtendedTime(prev => prev + 1);
+          const elapsed = Math.round((Date.now() - extendedStartTimeRef.current) / 1000);
+          setExtendedTime(elapsed);
+          if (isAndroid) {
+            ForegroundService.updateForegroundService({
+              id: 1,
+              title: 'Meditation Timer — Session Complete',
+              body: `Extended: +${formatTime(elapsed)}`,
+            }).catch(() => {});
+          }
         }, 1000);
       } else if (timeLeft > 0) {
         interval = setInterval(() => {
-          setTimeLeft(prev => prev - 1);
+          const remaining = Math.max(0, Math.round((phaseEndTimeRef.current - Date.now()) / 1000));
+          setTimeLeft(remaining);
+          if (isAndroid) {
+            const notifTitle = isCountingDown
+              ? 'Meditation Timer'
+              : `Meditation Timer — Phase ${(activePhaseIndex ?? 0) + 1} of ${executionPhases.length}`;
+            const notifBody = isCountingDown
+              ? `Starting in ${remaining}s...`
+              : `${formatTime(remaining)} remaining`;
+            ForegroundService.updateForegroundService({
+              id: 1,
+              title: notifTitle,
+              body: notifBody,
+            }).catch(() => {});
+          }
         }, 1000);
       } else if (timeLeft === 0) {
         if (isCountingDown) {
-          // Countdown finished, start phase 0
+          // Countdown finished — start phase 0
           setIsCountingDown(false);
           playStartSequence();
           setActivePhaseIndex(0);
-          setTimeLeft((executionPhases[0].hours || 0) * 3600 + executionPhases[0].minutes * 60 + executionPhases[0].seconds);
+          const phase0Secs = (executionPhases[0].hours || 0) * 3600 + executionPhases[0].minutes * 60 + executionPhases[0].seconds;
+          phaseEndTimeRef.current = Date.now() + phase0Secs * 1000;
+          setTimeLeft(phase0Secs);
         } else if (activePhaseIndex !== null) {
           if (activePhaseIndex < executionPhases.length - 1) {
             // Transition to next phase
             playTransitionSequence();
             const nextIndex = activePhaseIndex + 1;
+            const nextPhaseSecs = (executionPhases[nextIndex].hours || 0) * 3600 + executionPhases[nextIndex].minutes * 60 + executionPhases[nextIndex].seconds;
+            phaseEndTimeRef.current = Date.now() + nextPhaseSecs * 1000;
             setActivePhaseIndex(nextIndex);
-            setTimeLeft((executionPhases[nextIndex].hours || 0) * 3600 + executionPhases[nextIndex].minutes * 60 + executionPhases[nextIndex].seconds);
+            setTimeLeft(nextPhaseSecs);
           } else {
-            // Sequence completion
+            // Session complete — enter extended mode
             playEndSequence();
+            extendedStartTimeRef.current = Date.now();
             setIsExtended(true);
             setIsFinished(true);
           }
@@ -240,13 +289,13 @@ export default function App() {
     }
     const num = parseInt(value, 10);
     if (isNaN(num)) return;
-    
+
     let clampedValue = num;
     if (field === 'hours') clampedValue = Math.max(0, Math.min(99, num));
     if (field === 'minutes') clampedValue = Math.max(0, Math.min(99, num));
     if (field === 'seconds') clampedValue = Math.max(0, Math.min(59, num));
     if (field === 'repeat') clampedValue = Math.max(0, Math.min(99, num));
-    
+
     setPhases(phases.map(p => p.id === id ? { ...p, [field]: clampedValue } : p));
   };
 
@@ -314,7 +363,7 @@ export default function App() {
     });
     setExecutionPhases(execPhases);
 
-    // Unlock bell2 context (bell1 will be unlocked by playStartSequence)
+    // Unlock bell2 audio context
     if (bell2Ref.current) {
       bell2Ref.current.volume = 0;
       const p = bell2Ref.current.play();
@@ -330,8 +379,10 @@ export default function App() {
     }
 
     if (isCountdownEnabled && countdownSeconds > 0) {
+      const cdSecs = countdownSeconds;
+      phaseEndTimeRef.current = Date.now() + cdSecs * 1000;
       setIsCountingDown(true);
-      setTimeLeft(countdownSeconds);
+      setTimeLeft(cdSecs);
       setIsRunning(true);
       setIsFinished(false);
       setIsExtended(false);
@@ -340,12 +391,25 @@ export default function App() {
     } else {
       playStartSequence();
       setActivePhaseIndex(0);
-      setTimeLeft((execPhases[0].hours || 0) * 3600 + execPhases[0].minutes * 60 + execPhases[0].seconds);
+      const firstPhaseSecs = (execPhases[0].hours || 0) * 3600 + execPhases[0].minutes * 60 + execPhases[0].seconds;
+      phaseEndTimeRef.current = Date.now() + firstPhaseSecs * 1000;
+      setTimeLeft(firstPhaseSecs);
       setIsRunning(true);
       setIsFinished(false);
       setIsExtended(false);
       setExtendedTime(0);
       setIsCountingDown(false);
+    }
+
+    // Start Android foreground service to persist in background
+    if (isAndroid) {
+      ForegroundService.requestPermissions().catch(() => {});
+      ForegroundService.startForegroundService({
+        id: 1,
+        title: 'Meditation Timer',
+        body: 'Session starting...',
+        smallIcon: 'ic_stat_timer',
+      }).catch(() => {});
     }
   };
 
@@ -372,11 +436,20 @@ export default function App() {
     setIsCountingDown(false);
     setIsExtended(false);
     setExtendedTime(0);
+    if (isAndroid) {
+      ForegroundService.stopForegroundService().catch(() => {});
+    }
   };
 
   const cancelStop = () => {
     setIsStopModalOpen(false);
     if (wasRunningBeforeStop) {
+      // Re-anchor timestamp refs to now so the timer stays accurate after modal dismissal
+      if (!isExtended) {
+        phaseEndTimeRef.current = Date.now() + timeLeft * 1000;
+      } else {
+        extendedStartTimeRef.current = Date.now() - extendedTime * 1000;
+      }
       setIsRunning(true);
     }
   };
@@ -394,33 +467,29 @@ export default function App() {
         bell2Ref.current.currentTime = 0;
       }
     } else {
+      // Re-anchor timestamp refs before resuming so elapsed pause time isn't counted
+      if (!isExtended) {
+        phaseEndTimeRef.current = Date.now() + timeLeft * 1000;
+      } else {
+        extendedStartTimeRef.current = Date.now() - extendedTime * 1000;
+      }
       setIsRunning(true);
     }
-  };
-
-  const formatTime = (totalSeconds: number) => {
-    const h = Math.floor(totalSeconds / 3600);
-    const m = Math.floor((totalSeconds % 3600) / 60);
-    const s = totalSeconds % 60;
-    if (h > 0) {
-      return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-    }
-    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
   return (
     <div className="min-h-screen bg-stone-950 text-stone-200 font-sans flex flex-col items-center py-12 px-4 selection:bg-stone-800">
       <div className="w-full max-w-2xl">
         <h1 className="text-2xl sm:text-3xl font-display font-normal text-stone-100 mb-4 text-center tracking-wide">Multi-Phase Meditation Timer</h1>
-        
+
         <div className="flex justify-between items-center mb-4">
           <label className="flex items-center gap-2 cursor-pointer text-stone-400 hover:text-stone-300 transition-colors">
             <div className="relative">
-              <input 
-                type="checkbox" 
-                className="sr-only" 
-                checked={isCountdownEnabled} 
-                onChange={() => setIsCountdownEnabled(!isCountdownEnabled)} 
+              <input
+                type="checkbox"
+                className="sr-only"
+                checked={isCountdownEnabled}
+                onChange={() => setIsCountdownEnabled(!isCountdownEnabled)}
               />
               <div className={`block w-10 h-6 rounded-full transition-colors ${isCountdownEnabled ? 'bg-stone-600' : 'bg-stone-800'}`}></div>
               <div className={`absolute left-1 top-1 bg-stone-300 w-4 h-4 rounded-full transition-transform ${isCountdownEnabled ? 'transform translate-x-4' : ''}`}></div>
@@ -430,12 +499,12 @@ export default function App() {
 
           <div className="flex items-center gap-2 text-stone-400 bg-stone-900/50 px-3 py-1.5 rounded-xl border border-stone-800">
             <Volume2 size={16} />
-            <input 
-              type="range" 
-              min="0" 
-              max="1" 
-              step="0.01" 
-              value={volume} 
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.01"
+              value={volume}
               onChange={(e) => setVolume(parseFloat(e.target.value))}
               className="w-24 accent-stone-500 cursor-pointer"
             />
@@ -448,11 +517,11 @@ export default function App() {
               <div className="flex items-center justify-between bg-stone-900/40 p-4 rounded-2xl border border-stone-800/50">
                 <span className="text-stone-400 text-sm">Preparation countdown</span>
                 <div className="flex items-center gap-2">
-                  <input 
-                    type="number" 
-                    min="0" 
-                    max="60" 
-                    value={countdownSeconds.toString()} 
+                  <input
+                    type="number"
+                    min="0"
+                    max="60"
+                    value={countdownSeconds.toString()}
                     onChange={(e) => {
                       const val = parseInt(e.target.value, 10);
                       if (!isNaN(val)) setCountdownSeconds(Math.min(60, Math.max(0, val)));
@@ -467,18 +536,18 @@ export default function App() {
             <div className="space-y-3">
               {phases.map((phase, index) => (
                 <div key={phase.id} className="flex flex-row items-center justify-between gap-1 sm:gap-4 bg-stone-900/80 p-2 sm:p-4 rounded-2xl border border-stone-800 shadow-sm transition-all hover:border-stone-700">
-                  
+
                   <div className="flex items-center gap-1 sm:gap-4">
                     <div className="text-stone-500 text-xs sm:text-sm text-center w-4 sm:w-6 shrink-0">{index + 1}.</div>
-                    
+
                     <div className="flex items-center gap-0.5 sm:gap-2">
                       <div className="flex flex-col items-center">
                         <button onClick={() => handleIncrement(phase.id, 'hours', 1)} className="text-stone-500 hover:text-stone-300 transition-colors p-0 sm:p-0.5"><ChevronUp className="w-3 h-3 sm:w-4 sm:h-4" /></button>
-                        <input 
-                          type="number" 
+                        <input
+                          type="number"
                           min="0"
                           max="99"
-                          value={(phase.hours || 0).toString()} 
+                          value={(phase.hours || 0).toString()}
                           onChange={(e) => handlePhaseChange(phase.id, 'hours', e.target.value)}
                           onBlur={handleBlur}
                           className="w-9 sm:w-16 bg-stone-950 text-stone-100 text-center text-sm sm:text-xl py-1 sm:py-2 rounded-lg sm:rounded-xl border border-stone-800 focus:outline-none focus:ring-2 focus:ring-stone-600 focus:border-transparent transition-all"
@@ -488,11 +557,11 @@ export default function App() {
                       <span className="text-stone-500 text-sm sm:text-xl pb-1">:</span>
                       <div className="flex flex-col items-center">
                         <button onClick={() => handleIncrement(phase.id, 'minutes', 1)} className="text-stone-500 hover:text-stone-300 transition-colors p-0 sm:p-0.5"><ChevronUp className="w-3 h-3 sm:w-4 sm:h-4" /></button>
-                        <input 
-                          type="number" 
+                        <input
+                          type="number"
                           min="0"
                           max="99"
-                          value={phase.minutes.toString()} 
+                          value={phase.minutes.toString()}
                           onChange={(e) => handlePhaseChange(phase.id, 'minutes', e.target.value)}
                           onBlur={handleBlur}
                           className="w-9 sm:w-16 bg-stone-950 text-stone-100 text-center text-sm sm:text-xl py-1 sm:py-2 rounded-lg sm:rounded-xl border border-stone-800 focus:outline-none focus:ring-2 focus:ring-stone-600 focus:border-transparent transition-all"
@@ -502,11 +571,11 @@ export default function App() {
                       <span className="text-stone-500 text-sm sm:text-xl pb-1">:</span>
                       <div className="flex flex-col items-center">
                         <button onClick={() => handleIncrement(phase.id, 'seconds', 1)} className="text-stone-500 hover:text-stone-300 transition-colors p-0 sm:p-0.5"><ChevronUp className="w-3 h-3 sm:w-4 sm:h-4" /></button>
-                        <input 
-                          type="number" 
+                        <input
+                          type="number"
                           min="0"
                           max="59"
-                          value={phase.seconds.toString()} 
+                          value={phase.seconds.toString()}
                           onChange={(e) => handlePhaseChange(phase.id, 'seconds', e.target.value)}
                           onBlur={handleBlur}
                           className="w-9 sm:w-16 bg-stone-950 text-stone-100 text-center text-sm sm:text-xl py-1 sm:py-2 rounded-lg sm:rounded-xl border border-stone-800 focus:outline-none focus:ring-2 focus:ring-stone-600 focus:border-transparent transition-all"
@@ -515,17 +584,17 @@ export default function App() {
                       </div>
                     </div>
                   </div>
-                  
+
                   <div className="flex items-center justify-end gap-1 sm:gap-4 shrink-0">
                     <div className="flex items-center gap-1 sm:gap-2 text-stone-400 text-[10px] sm:text-sm whitespace-nowrap">
                       <span className="opacity-70">Repeat</span>
                       <div className="flex flex-col items-center">
                         <button onClick={() => handleIncrement(phase.id, 'repeat', 1)} className="text-stone-500 hover:text-stone-300 transition-colors p-0 sm:p-0.5"><ChevronUp className="w-3 h-3 sm:w-4 sm:h-4" /></button>
-                        <input 
-                          type="number" 
+                        <input
+                          type="number"
                           min="1"
                           max="99"
-                          value={phase.repeat === 0 ? '' : phase.repeat.toString()} 
+                          value={phase.repeat === 0 ? '' : phase.repeat.toString()}
                           onChange={(e) => handlePhaseChange(phase.id, 'repeat', e.target.value)}
                           onBlur={handleBlur}
                           className="w-8 sm:w-16 bg-stone-950 text-stone-100 text-center text-xs sm:text-base py-1 sm:py-2 rounded-lg sm:rounded-xl border border-stone-800 focus:outline-none focus:ring-2 focus:ring-stone-600 focus:border-transparent transition-all"
@@ -537,7 +606,7 @@ export default function App() {
 
                     <div className="flex justify-end shrink-0 w-6 sm:w-10">
                       {phases.length > 1 ? (
-                        <button 
+                        <button
                           onClick={() => deletePhase(phase.id)}
                           className="p-1 sm:p-2 text-stone-500 hover:text-red-400 transition-colors rounded-full hover:bg-stone-800"
                           aria-label="Delete phase"
@@ -552,9 +621,9 @@ export default function App() {
                 </div>
               ))}
             </div>
-            
+
             <div className="flex gap-4">
-              <button 
+              <button
                 onClick={addPhase}
                 className="flex-1 py-4 border-2 border-dashed border-stone-800 text-stone-400 rounded-2xl hover:border-stone-600 hover:text-stone-300 transition-all flex items-center justify-center gap-2"
               >
@@ -574,7 +643,7 @@ export default function App() {
               <div className="text-stone-400 text-sm mb-4 tracking-wide text-center">
                 Total time: {formatVerboseTime(totalSeconds)}
               </div>
-              <button 
+              <button
                 onClick={handleStart}
                 className="w-full bg-stone-200 text-stone-950 text-xl font-medium py-4 rounded-2xl hover:bg-white transition-all shadow-[0_0_40px_-10px_rgba(255,255,255,0.1)] flex items-center justify-center gap-2"
               >
@@ -588,7 +657,7 @@ export default function App() {
             <div className="text-stone-500 font-medium tracking-widest uppercase text-sm mb-12">
               {isCountingDown ? "Starting in..." : isFinished ? "Session Complete" : `Phase ${activePhaseIndex! + 1} of ${executionPhases.length}`}
             </div>
-            
+
             <div className="text-[7rem] leading-none font-light text-stone-100 tracking-tighter mb-4 tabular-nums">
               {isExtended ? formatTime(extendedTime) : formatTime(timeLeft)}
             </div>
@@ -607,14 +676,14 @@ export default function App() {
 
             <div className="flex gap-6">
               {!isExtended && (
-                <button 
+                <button
                   onClick={togglePause}
                   className="w-20 h-20 rounded-full bg-stone-800 text-stone-100 flex items-center justify-center hover:bg-stone-700 transition-all shadow-lg"
                 >
                   {isRunning ? <Pause size={28} className="fill-current" /> : <Play size={28} className="fill-current ml-1" />}
                 </button>
               )}
-              <button 
+              <button
                 onClick={handleStop}
                 className="w-20 h-20 rounded-full border-2 border-stone-800 text-stone-400 flex items-center justify-center hover:bg-stone-800 hover:text-stone-200 transition-all"
               >
@@ -624,7 +693,7 @@ export default function App() {
           </div>
         )}
       </div>
-      
+
       <audio ref={bell1Ref} src="/bell.mp3" preload="auto" />
       <audio ref={bell2Ref} src="/bell2.mp3" preload="auto" />
 
@@ -634,7 +703,7 @@ export default function App() {
             <h2 className="text-xl font-display font-normal text-stone-100 mb-4">Reset Timer</h2>
             <p className="text-stone-400 mb-8">This will discard all changes you have made. Continue?</p>
             <div className="flex gap-4 justify-center">
-              <button 
+              <button
                 onClick={() => {
                   setPhases([{ id: 'phase-1', hours: 0, minutes: 5, seconds: 0, repeat: 1 }]);
                   setIsResetModalOpen(false);
@@ -643,7 +712,7 @@ export default function App() {
               >
                 Confirm
               </button>
-              <button 
+              <button
                 onClick={() => setIsResetModalOpen(false)}
                 className="flex-1 py-3 rounded-xl border border-stone-700 text-stone-300 hover:bg-stone-800 transition-colors"
               >
@@ -658,7 +727,7 @@ export default function App() {
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
           <div className="bg-stone-900 border border-stone-800 rounded-3xl p-6 sm:p-8 max-w-sm w-full shadow-2xl text-center">
             <h2 className="text-xl font-display font-normal text-stone-100 mb-4">Do you want to end the session?</h2>
-            
+
             <div className="text-stone-400 mb-8 space-y-2 text-left bg-stone-950/50 p-4 rounded-xl border border-stone-800/50">
               <div className="flex justify-between">
                 <span>Session time:</span>
@@ -675,13 +744,13 @@ export default function App() {
             </div>
 
             <div className="flex gap-4 justify-center">
-              <button 
+              <button
                 onClick={cancelStop}
                 className="flex-1 py-3 rounded-xl border border-stone-700 text-stone-300 hover:bg-stone-800 transition-colors"
               >
                 Resume
               </button>
-              <button 
+              <button
                 onClick={confirmStop}
                 className="flex-1 py-3 rounded-xl bg-stone-200 text-stone-950 font-medium hover:bg-white transition-colors"
               >
